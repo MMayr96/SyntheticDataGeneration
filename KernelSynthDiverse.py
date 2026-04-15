@@ -1424,7 +1424,7 @@ class VectorizedMixerCausal:
                         W = np.tril(np.random.randn(n_phys, n_phys), -1)
                         # Causal structural equation: Y = W*Y + X  => Y = (I - W)^-1 * X
                         mix_matrix = np.linalg.inv(np.eye(n_phys) - W)
-                        out_batch[b_orig, nr:, :] = mix_matrix @ sub_x[i, nr:, :]
+                        phys_base = sub_x[i, nr:, :].copy()
                         adj_phys = (np.abs(W) > 0.1).astype(np.float64) # True causal DAG
 
                         out_adj[b_orig, nr:, nr:] = adj_phys
@@ -1438,6 +1438,11 @@ class VectorizedMixerCausal:
                                 for j in range(n_phys):
                                     if connects[j]:
                                         out_adj[b_orig, r, nr + j] = 1.0
+                                        # Inject root signal into the physics node base
+                                        weight = np.random.uniform(0.3, 1.0) * (1.0 if np.random.random() < 0.5 else -1.0)
+                                        phys_base[j] += weight * sub_x[i, r, :]
+
+                        out_batch[b_orig, nr:, :] = mix_matrix @ phys_base
                     # Contemp = lag 0 everywhere, out_lags stays 0
 
             elif mode == 'none':
@@ -1517,6 +1522,12 @@ class FastPhysicsEngine:
                 if ns > 0: phys_arrays.append(self.gen_stat.generate_batch(ns, length))
                 phys_pool = np.vstack(phys_arrays)
                 np.random.shuffle(phys_pool)
+
+                # Pre-normalize the physics pool to standard normal
+                mu = phys_pool.mean(axis=1, keepdims=True)
+                sigma = phys_pool.std(axis=1, keepdims=True)
+                sigma = np.where(sigma < 1e-8, 1.0, sigma)
+                phys_pool = (phys_pool - mu) / sigma
             else:
                 phys_pool = np.empty((0, length))
 
@@ -2541,10 +2552,42 @@ def _validate_batch_quality_jit(
                     c_v += dc * dc
 
                 if p_v < 1e-9 or c_v < 1e-9: continue
-                corr = abs(cov / np.sqrt(p_v * c_v))
+                corr_at_lag = abs(cov / np.sqrt(p_v * c_v))
 
-                # Check if this correlation is actually meaningful
-                if corr >= min_edge_corr:
+                # Pearson correlation at lag=0 (contemporaneous)
+                p_mean0 = 0.0
+                c_mean0 = 0.0
+                for t in range(L):
+                    p_mean0 += x_batch[b, i, t]
+                    c_mean0 += x_batch[b, j, t]
+                p_mean0 /= L
+                c_mean0 /= L
+
+                cov0 = 0.0
+                p_var0 = 0.0
+                c_var0 = 0.0
+                for t in range(L):
+                    dp = x_batch[b, i, t] - p_mean0
+                    dc = x_batch[b, j, t] - c_mean0
+                    cov0 += dp * dc
+                    p_var0 += dp * dp
+                    c_var0 += dc * dc
+
+                if p_var0 < 1e-12 or c_var0 < 1e-12:
+                    corr_at_0 = 0.0
+                else:
+                    corr_at_0 = abs(cov0 / np.sqrt(p_var0 * c_var0))
+
+                # Decision: edge is good if correlation at lag is detectable and specific
+                lag_specific = (
+                    (corr_at_lag >= min_edge_corr)
+                    and (
+                        corr_at_lag >= 0.8 * corr_at_0
+                        or corr_at_lag >= 0.2
+                    )
+                )
+
+                if lag_specific:
                     n_good += 1
 
         if n_edges > 0:
