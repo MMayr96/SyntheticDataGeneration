@@ -863,21 +863,12 @@ class VectorizedMixerCausal:
                     out_batch[b_orig, :nr, :] = sub_x[i, :nr, :]
 
                     if n_phys > 0:
-                        # QR mixing only on physics nodes
-                        W = np.random.randn(n_phys, n_phys)
-                        Q, _ = np.linalg.qr(W)
-                        out_batch[b_orig, nr:, :] = Q @ sub_x[i, nr:, :]
+                        W = np.tril(np.random.randn(n_phys, n_phys), -1)
+                        # Causal structural equation: Y = W*Y + X  => Y = (I - W)^-1 * X
+                        mix_matrix = np.linalg.inv(np.eye(n_phys) - W)
+                        out_batch[b_orig, nr:, :] = mix_matrix @ sub_x[i, nr:, :]
+                        adj_phys = (np.abs(W) > 0.1).astype(np.float64) # True causal DAG
 
-                        # Physics↔physics adjacency from |Q|
-                        Q_abs = np.abs(Q)
-                        offdiag_mask = ~np.eye(n_phys, dtype=bool)
-                        offdiag = Q_abs[offdiag_mask]
-                        if len(offdiag) > 1:
-                            threshold = offdiag.mean() + 0.5 * offdiag.std()
-                        else:
-                            threshold = 0.5
-                        adj_phys = (Q_abs > threshold).astype(np.float64)
-                        np.fill_diagonal(adj_phys, 0.0)
                         out_adj[b_orig, nr:, nr:] = adj_phys
 
                         # Root→physics edges (each root influences some physics nodes)
@@ -970,11 +961,7 @@ class FastPhysicsEngine:
             cont_pool = np.vstack(arrays_physics)
             np.random.shuffle(cont_pool)
 
-            # Normalize physics pool
-            means = cont_pool.mean(axis=1, keepdims=True)
-            stds = cont_pool.std(axis=1, keepdims=True)
-            stds = np.where(stds < 1e-8, 1.0, stds)
-            cont_norm = (cont_pool - means) / stds
+            cont_norm = cont_pool
         else:
             cont_norm = np.empty((0, length), dtype=np.float64)
 

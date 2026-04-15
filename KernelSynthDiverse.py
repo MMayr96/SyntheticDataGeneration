@@ -1421,21 +1421,12 @@ class VectorizedMixerCausal:
                     out_batch[b_orig, :nr, :] = sub_x[i, :nr, :]
 
                     if n_phys > 0:
-                        # QR mixing only on physics nodes
-                        W = np.random.randn(n_phys, n_phys)
-                        Q, _ = np.linalg.qr(W)
-                        out_batch[b_orig, nr:, :] = Q @ sub_x[i, nr:, :]
+                        W = np.tril(np.random.randn(n_phys, n_phys), -1)
+                        # Causal structural equation: Y = W*Y + X  => Y = (I - W)^-1 * X
+                        mix_matrix = np.linalg.inv(np.eye(n_phys) - W)
+                        out_batch[b_orig, nr:, :] = mix_matrix @ sub_x[i, nr:, :]
+                        adj_phys = (np.abs(W) > 0.1).astype(np.float64) # True causal DAG
 
-                        # Physics↔physics adjacency from |Q|
-                        Q_abs = np.abs(Q)
-                        offdiag_mask = ~np.eye(n_phys, dtype=bool)
-                        offdiag = Q_abs[offdiag_mask]
-                        if len(offdiag) > 1:
-                            threshold = offdiag.mean() + 0.5 * offdiag.std()
-                        else:
-                            threshold = 0.5
-                        adj_phys = (Q_abs > threshold).astype(np.float64)
-                        np.fill_diagonal(adj_phys, 0.0)
                         out_adj[b_orig, nr:, nr:] = adj_phys
 
                         # Root→physics edges (each root influences some physics nodes)
@@ -1522,7 +1513,7 @@ class FastPhysicsEngine:
             if total_physics > 0:
                 nk = int(total_physics * 0.85)
                 ns = total_physics - nk
-                if nk > 0: phys_arrays.append(self.gen_kernel.generate_batch(nk, length, normalize=True))
+                if nk > 0: phys_arrays.append(self.gen_kernel.generate_batch(nk, length, normalize=False))
                 if ns > 0: phys_arrays.append(self.gen_stat.generate_batch(ns, length))
                 phys_pool = np.vstack(phys_arrays)
                 np.random.shuffle(phys_pool)
@@ -1891,19 +1882,16 @@ def _simulate_pid_control_loop(
             x[i, t] = np.random.normal(0.0, 0.5)
 
     # Causal structure: SP → Error → MV → PV, Disturbance → PV
-    if actual_nodes >= 2:
-        adj_out[0, 1] = 1.0  # SP → PV
-        lags_out[0, 1] = dead_time + int(tau1)
     if actual_nodes >= 3:
-        adj_out[0, 2] = 1.0  # SP → MV (via error)
-        lags_out[0, 2] = 1
         adj_out[2, 1] = 1.0  # MV → PV
         lags_out[2, 1] = dead_time
     if actual_nodes >= 4:
         adj_out[0, 3] = 1.0  # SP → Error
-        lags_out[0, 3] = 1
+        lags_out[0, 3] = 0
         adj_out[1, 3] = 1.0  # PV → Error
         lags_out[1, 3] = 1
+        adj_out[3, 2] = 1.0  # Error -> MV
+        lags_out[3, 2] = 0
     if actual_nodes >= 5:
         adj_out[4, 1] = 1.0  # Disturbance → PV
         lags_out[4, 1] = 1
@@ -2014,10 +2002,10 @@ def _simulate_batch_process(
         lags_out[0, 1] = 1
     if n_nodes >= 3:
         adj[1, 2] = 1.0  # Temperature → Pressure
-        lags_out[1, 2] = np.random.randint(1, 5)
+        lags_out[1, 2] = 0
     if n_nodes >= 4:
         adj[1, 3] = 1.0  # Temperature → Quality
-        lags_out[1, 3] = np.random.randint(1, 10)
+        lags_out[1, 3] = 0
 
     # Normalize
     for i in range(n_nodes):
@@ -2171,7 +2159,7 @@ def _simulate_conservation_network(
             # Flow → downstream Level
             if node_idx + 2 < n_nodes:
                 adj[node_idx + 1, node_idx + 2] = 1.0
-                lags_out[node_idx + 1, node_idx + 2] = 1
+                lags_out[node_idx + 1, node_idx + 2] = 0
 
         node_idx += 2
 
@@ -2245,7 +2233,7 @@ def _simulate_multiscale_process(
 
         # Apply slow-scale coupling
         for t in range(lag, length):
-            parent_val = slow_signals[j, t - lag]
+            parent_val = x[j, t - lag]
             effect_val = _coupling_fn(parent_val, ftype, p0, p1, 0.0)
             x[i, t] = (1.0 - alpha) * x[i, t] + alpha * effect_val
 
@@ -2347,7 +2335,7 @@ class IndustrialProcessSimulator:
 
         arrays = []
         if n_kernel > 0:
-            arrays.append(self.gen_kernel.generate_batch(n_kernel, length, normalize=True))
+            arrays.append(self.gen_kernel.generate_batch(n_kernel, length, normalize=False))
         if n_stat > 0:
             arrays.append(self.gen_stat.generate_batch(n_stat, length))
 
