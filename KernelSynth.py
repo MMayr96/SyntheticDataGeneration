@@ -866,7 +866,7 @@ class VectorizedMixerCausal:
                         W = np.tril(np.random.randn(n_phys, n_phys), -1)
                         # Causal structural equation: Y = W*Y + X  => Y = (I - W)^-1 * X
                         mix_matrix = np.linalg.inv(np.eye(n_phys) - W)
-                        out_batch[b_orig, nr:, :] = mix_matrix @ sub_x[i, nr:, :]
+                        phys_base = sub_x[i, nr:, :].copy()
                         adj_phys = (np.abs(W) > 0.1).astype(np.float64) # True causal DAG
 
                         out_adj[b_orig, nr:, nr:] = adj_phys
@@ -880,6 +880,11 @@ class VectorizedMixerCausal:
                                 for j in range(n_phys):
                                     if connects[j]:
                                         out_adj[b_orig, r, nr + j] = 1.0
+                                        # Inject root signal into the physics node base
+                                        weight = np.random.uniform(0.3, 1.0) * (1.0 if np.random.random() < 0.5 else -1.0)
+                                        phys_base[j] += weight * sub_x[i, r, :]
+
+                        out_batch[b_orig, nr:, :] = mix_matrix @ phys_base
                     # Contemp = lag 0 everywhere, out_lags stays 0
 
             elif mode == 'none':
@@ -961,7 +966,11 @@ class FastPhysicsEngine:
             cont_pool = np.vstack(arrays_physics)
             np.random.shuffle(cont_pool)
 
-            cont_norm = cont_pool
+            # Pre-normalize the physics pool to standard normal
+            mu = cont_pool.mean(axis=1, keepdims=True)
+            sigma = cont_pool.std(axis=1, keepdims=True)
+            sigma = np.where(sigma < 1e-8, 1.0, sigma)
+            cont_norm = (cont_pool - mu) / sigma
         else:
             cont_norm = np.empty((0, length), dtype=np.float64)
 
@@ -1086,27 +1095,41 @@ def _validate_batch_quality_jit(
         # ── Node degeneracy check ──
         nodes_ok = True
         for n in range(N):
-            node_mean = 0.0
             has_bad = False
             for t in range(L):
                 v = x_batch[b, n, t]
                 if v != v or v == np.inf or v == -np.inf:  # NaN/Inf check
                     has_bad = True
                     break
-                node_mean += v
 
             if has_bad:
                 nodes_ok = False
                 break
 
-            node_mean /= L
-            node_var = 0.0
-            for t in range(L):
-                d = x_batch[b, n, t] - node_mean
-                node_var += d * d
-            node_std = np.sqrt(node_var / L)
+            # Liveness/Flatness Check
+            tail_start = int(L * 0.75)
+            tail_len = L - tail_start
 
-            if node_std < 0.05:
+            t_sum = 0.0
+            for t in range(tail_start, L):
+                t_sum += x_batch[b, n, t]
+            t_mean = t_sum / tail_len
+
+            t_var = 0.0
+            for t in range(tail_start, L):
+                diff = x_batch[b, n, t] - t_mean
+                t_var += diff * diff
+            tail_std = np.sqrt(t_var / tail_len)
+
+            if tail_std < 0.02:
+                nodes_ok = False
+                break
+
+            changes = 0
+            for t in range(1, L):
+                if abs(x_batch[b, n, t] - x_batch[b, n, t-1]) > 1e-5:
+                    changes += 1
+            if changes < 5:
                 nodes_ok = False
                 break
 
